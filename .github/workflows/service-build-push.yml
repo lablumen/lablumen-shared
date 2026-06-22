@@ -1,0 +1,74 @@
+name: service-build-push
+
+# Reusable build+scan+push for ONE backend service. Builds the image tagged with the 7-char git SHA,
+# runs the Trivy gate, pushes to ECR (OIDC), and EMITS the tag as an output. No git write-back here —
+# the caller's cd-dev aggregation job handles the GitOps commit (avoids git races).
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      service-path:
+        required: true
+        type: string
+      ecr-registry:
+        required: true
+        type: string
+      ecr-repository:
+        description: "ECR repo name, e.g. lablumen/appointment-service."
+        required: true
+        type: string
+      role-to-assume:
+        description: "IAM role ARN to assume via OIDC (ECR push)."
+        required: true
+        type: string
+      aws-region:
+        required: false
+        type: string
+        default: us-east-1
+    outputs:
+      image-tag:
+        description: "The 7-char git SHA tag that was built and pushed."
+        value: ${{ jobs.build.outputs.tag }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build
+        run: |
+          IMAGE="${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}"
+          docker build -t "$IMAGE:${{ steps.meta.outputs.tag }}" "${{ inputs.service-path }}"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Trivy gate (fail on CRITICAL/HIGH before push)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+
+      - name: Push
+        run: docker push "$IMAGE:${{ steps.meta.outputs.tag }}"
