@@ -12,11 +12,8 @@ on:
       service-path:
         required: true
         type: string
-      ecr-registry:
-        required: true
-        type: string
       ecr-repository:
-        description: "ECR repo name, e.g. lablumen/appointment-service."
+        description: "ECR repo name, e.g. lablumen/appointment-service. The registry host is derived from the ECR login (account-portable — no account ID passed in)."
         required: true
         type: string
       role-to-assume:
@@ -53,11 +50,12 @@ jobs:
           role-to-assume: ${{ inputs.role-to-assume }}
           aws-region: ${{ inputs.aws-region }}
 
-      - uses: aws-actions/amazon-ecr-login@v2
+      - id: login
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build
         run: |
-          IMAGE="${{ inputs.ecr-registry }}/${{ inputs.ecr-repository }}"
+          IMAGE="${{ steps.login.outputs.registry }}/${{ inputs.ecr-repository }}"
           docker build -t "$IMAGE:${{ steps.meta.outputs.tag }}" "${{ inputs.service-path }}"
           echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
 
