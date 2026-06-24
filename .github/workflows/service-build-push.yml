@@ -1,19 +1,23 @@
 name: service-build-push
 
-# Reusable build+scan+push for ONE backend service. Builds the image tagged with the 7-char git SHA,
-# runs the Trivy gate, pushes to ECR (OIDC), and EMITS the tag as an output. No git write-back here —
-# the caller's cd-dev aggregation job handles the GitOps commit (avoids git races).
+# Reusable DEV deploy for ONE backend service (polyrepo, trunk-based): on push to main, build the image
+# tagged with the 7-char git SHA, run the Trivy gate, push to ECR (OIDC), then write that SHA into
+# lablumen-k8s services/<service>/values-dev.yaml. The write-back uses a `git pull --rebase` retry loop
+# so concurrent service repos committing to lablumen-k8s don't collide.
 on:
   workflow_call:
     inputs:
       service-name:
+        description: "Service id, e.g. appointment-service (also the k8s services/<name> folder)."
         required: true
         type: string
       service-path:
-        required: true
+        description: "Path to the service source (Dockerfile + app/). Repo root in polyrepo."
+        required: false
         type: string
+        default: "."
       ecr-repository:
-        description: "ECR repo name, e.g. lablumen/appointment-service. The registry host is derived from the ECR login (account-portable — no account ID passed in)."
+        description: "ECR repo name, e.g. lablumen/appointment-service (registry host derived from ECR login)."
         required: true
         type: string
       role-to-assume:
@@ -24,6 +28,15 @@ on:
         required: false
         type: string
         default: us-east-1
+      k8s-repo:
+        description: "GitOps repo holding the values files."
+        required: false
+        type: string
+        default: lablumen/lablumen-k8s
+    secrets:
+      K8S_REPO_PAT:
+        description: "PAT with write access to the k8s repo (for the values-dev.yaml commit)."
+        required: true
     outputs:
       image-tag:
         description: "The 7-char git SHA tag that was built and pushed."
@@ -70,3 +83,30 @@ jobs:
 
       - name: Push
         run: docker push "$IMAGE:${{ steps.meta.outputs.tag }}"
+
+      # ---- GitOps write-back: bump values-dev.yaml in lablumen-k8s (rebase-retry for race safety) ----
+      - name: Checkout ${{ inputs.k8s-repo }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.k8s-repo }}
+          token: ${{ secrets.K8S_REPO_PAT }}
+          path: k8s
+
+      - name: Bump dev image tag
+        working-directory: k8s
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          SVC: ${{ inputs.service-name }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          f="services/${SVC}/values-dev.yaml"
+          yq -i ".image.tag = \"${TAG}\"" "$f"
+          if git diff --quiet; then echo "values-dev already at ${TAG}"; exit 0; fi
+          git add "$f"
+          git commit -m "cd(dev): ${SVC} -> ${TAG}"
+          for i in $(seq 1 5); do
+            if git pull --rebase origin main && git push origin main; then echo "pushed"; exit 0; fi
+            echo "push conflict, retry $i/5"; sleep 5
+          done
+          echo "::error::failed to push values-dev after retries"; exit 1

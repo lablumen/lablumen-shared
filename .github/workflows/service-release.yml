@@ -1,0 +1,102 @@
+name: service-release
+
+# Reusable PROD promotion for ONE backend service. Triggered by a GitHub Release on the commit already
+# deployed + validated in DEV. Build-once/promote: it does NOT rebuild — it retags the existing ECR image
+# (the DEV 7-char SHA) to the release semver (manifest copy; works with IMMUTABLE repos since the semver
+# tag is new), then writes the semver into lablumen-k8s services/<service>/values-prod.yaml (rebase-retry).
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      ecr-repository:
+        required: true
+        type: string
+      role-to-assume:
+        description: "IAM role ARN to assume via OIDC (ECR retag)."
+        required: true
+        type: string
+      release-tag:
+        description: "Semver release tag, e.g. v1.2.0 (github.event.release.tag_name)."
+        required: true
+        type: string
+      aws-region:
+        required: false
+        type: string
+        default: us-east-1
+      k8s-repo:
+        required: false
+        type: string
+        default: lablumen/lablumen-k8s
+    secrets:
+      K8S_REPO_PAT:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The release event's commit is the deployed-to-DEV commit → its 7-char SHA is the DEV image tag.
+      - id: meta
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Retag ECR image  <sha> -> <semver>  (manifest copy, no rebuild)
+        env:
+          REPO: ${{ inputs.ecr-repository }}
+          REGION: ${{ inputs.aws-region }}
+          SHA: ${{ steps.meta.outputs.sha }}
+          SEMVER: ${{ inputs.release-tag }}
+        run: |
+          MANIFEST=$(aws ecr batch-get-image --repository-name "$REPO" --region "$REGION" \
+            --image-ids imageTag="$SHA" --query 'images[0].imageManifest' --output text)
+          if [ -z "$MANIFEST" ] || [ "$MANIFEST" = "None" ]; then
+            echo "::error::No image $REPO:$SHA in ECR — release must be on a commit already deployed to DEV."; exit 1
+          fi
+          if aws ecr put-image --repository-name "$REPO" --region "$REGION" \
+               --image-tag "$SEMVER" --image-manifest "$MANIFEST" >/dev/null 2>&1; then
+            echo "retagged $REPO:$SHA -> :$SEMVER"
+          else
+            echo "tag $SEMVER already exists on $REPO (idempotent) — continuing"
+          fi
+
+      # ---- GitOps write-back: bump values-prod.yaml (rebase-retry) ----
+      - name: Checkout ${{ inputs.k8s-repo }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.k8s-repo }}
+          token: ${{ secrets.K8S_REPO_PAT }}
+          path: k8s
+
+      - name: Bump prod image tag
+        working-directory: k8s
+        env:
+          SEMVER: ${{ inputs.release-tag }}
+          SVC: ${{ inputs.service-name }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          f="services/${SVC}/values-prod.yaml"
+          yq -i ".image.tag = \"${SEMVER}\"" "$f"
+          if git diff --quiet; then echo "values-prod already at ${SEMVER}"; exit 0; fi
+          git add "$f"
+          git commit -m "cd(prod): ${SVC} -> ${SEMVER}"
+          for i in $(seq 1 5); do
+            if git pull --rebase origin main && git push origin main; then echo "pushed"; exit 0; fi
+            echo "push conflict, retry $i/5"; sleep 5
+          done
+          echo "::error::failed to push values-prod after retries"; exit 1
