@@ -1,7 +1,7 @@
 name: service-pr
 
-# Reusable PR gate for ONE backend service: lint + test + SonarCloud (SAST) + Snyk (SCA) +
-# Trivy (container scan, never pushed). All hard-fail. Called per changed service by lablumen-app.
+# Reusable PR gate for ONE service (Python or Node): lint + test + SonarCloud (SAST) + Snyk (SCA) +
+# Trivy (container scan, never pushed). All hard-fail. Called per changed service by the app CI.
 on:
   workflow_call:
     inputs:
@@ -10,17 +10,31 @@ on:
         required: true
         type: string
       service-path:
-        description: "Path to the service source (Dockerfile + app/ + requirements)."
+        description: "Path to the service source (Dockerfile + source dir + dependency manifest)."
         required: true
         type: string
+      runtime:
+        description: "Application runtime: 'node' or 'python'. Drives install/lint/test steps."
+        required: false
+        type: string
+        default: python
       sonar-organization:
         description: "SonarCloud organization key."
         required: true
         type: string
+      sonar-sources:
+        description: "Comma-separated source paths for SonarCloud analysis."
+        required: false
+        type: string
+        default: app
       python-version:
         required: false
         type: string
         default: "3.12"
+      node-version:
+        required: false
+        type: string
+        default: "20"
     secrets:
       SONAR_TOKEN:
         required: true
@@ -35,20 +49,44 @@ jobs:
         with:
           fetch-depth: 0          # SonarCloud needs full history
 
+      # ---- Python setup ----
       - uses: actions/setup-python@v5
+        if: inputs.runtime == 'python'
         with:
           python-version: ${{ inputs.python-version }}
 
-      - name: Install deps
+      - name: Install Python deps
+        if: inputs.runtime == 'python'
         run: pip install -r "${{ inputs.service-path }}/requirements-dev.txt"
 
       - name: Ruff
+        if: inputs.runtime == 'python'
         run: ruff check "${{ inputs.service-path }}"
 
       - name: Pytest
+        if: inputs.runtime == 'python'
         working-directory: ${{ inputs.service-path }}
         run: python -m pytest -q
 
+      # ---- Node setup ----
+      - uses: actions/setup-node@v4
+        if: inputs.runtime == 'node'
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.service-path }}/package-lock.json
+
+      - name: Install Node deps
+        if: inputs.runtime == 'node'
+        working-directory: ${{ inputs.service-path }}
+        run: npm ci
+
+      - name: Build (type-check + catch compilation errors)
+        if: inputs.runtime == 'node'
+        working-directory: ${{ inputs.service-path }}
+        run: npm run build
+
+      # ---- SAST ----
       - name: SonarCloud (SAST) + quality gate
         uses: SonarSource/sonarqube-scan-action@v3
         env:
@@ -59,17 +97,29 @@ jobs:
             -Dsonar.host.url=https://sonarcloud.io
             -Dsonar.organization=${{ inputs.sonar-organization }}
             -Dsonar.projectKey=${{ inputs.sonar-organization }}_lablumen-${{ inputs.service-name }}
-            -Dsonar.sources=app
-            -Dsonar.exclusions=**/tests/**
+            -Dsonar.sources=${{ inputs.sonar-sources }}
+            -Dsonar.exclusions=**/tests/**,**/*.test.*,**/*.spec.*
             -Dsonar.qualitygate.wait=true
 
-      - name: Snyk (SCA)
+      # ---- SCA ----
+      - name: Snyk (SCA) — Python
+        if: inputs.runtime == 'python'
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           npm install -g snyk
           snyk test --file="${{ inputs.service-path }}/requirements.txt" --severity-threshold=high
 
+      - name: Snyk (SCA) — Node
+        if: inputs.runtime == 'node'
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        working-directory: ${{ inputs.service-path }}
+        run: |
+          npm install -g snyk
+          snyk test --severity-threshold=high
+
+      # ---- Container scan ----
       - name: Build image (temporary, never pushed)
         run: docker build -t "scan:${{ inputs.service-name }}" "${{ inputs.service-path }}"
 
