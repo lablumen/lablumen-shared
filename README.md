@@ -22,3 +22,4 @@ truth for CI/CD logic. Consuming repos (`lablumen-app`) call these as thin calle
   `lablumen-k8s` → ArgoCD syncs. No git race.
 - **Refs:** callers pin `@main`.
 # lablumen-shared
+#

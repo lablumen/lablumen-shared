@@ -112,6 +112,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        if: inputs.runtime == 'python'
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install Python deps
+        if: inputs.runtime == 'python'
+        run: pip install -r "${{ inputs.service-path }}/requirements.txt"
+
       - name: Snyk (SCA) — Python
         if: inputs.runtime == 'python'
         env:
