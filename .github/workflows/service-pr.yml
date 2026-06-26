@@ -42,12 +42,10 @@ on:
         required: true
 
 jobs:
-  pr:
+  lint-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0          # SonarCloud needs full history
 
       # ---- Python setup ----
       - uses: actions/setup-python@v5
@@ -86,7 +84,14 @@ jobs:
         working-directory: ${{ inputs.service-path }}
         run: npm run build
 
-      # ---- SAST ----
+  sast:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # SonarCloud needs full history
+
       - name: SonarCloud (SAST) + quality gate
         uses: SonarSource/sonarqube-scan-action@v3
         env:
@@ -101,7 +106,12 @@ jobs:
             -Dsonar.exclusions=**/tests/**,**/*.test.*,**/*.spec.*
             -Dsonar.qualitygate.wait=true
 
-      # ---- SCA ----
+  sca:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Snyk (SCA) — Python
         if: inputs.runtime == 'python'
         env:
@@ -109,6 +119,18 @@ jobs:
         run: |
           npm install -g snyk
           snyk test --file="${{ inputs.service-path }}/requirements.txt" --severity-threshold=high
+
+      - uses: actions/setup-node@v4
+        if: inputs.runtime == 'node'
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.service-path }}/package-lock.json
+
+      - name: Install Node deps
+        if: inputs.runtime == 'node'
+        working-directory: ${{ inputs.service-path }}
+        run: npm ci
 
       - name: Snyk (SCA) — Node
         if: inputs.runtime == 'node'
@@ -119,7 +141,12 @@ jobs:
           npm install -g snyk
           snyk test --severity-threshold=high
 
-      # ---- Container scan ----
+  container-scan:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Build image (temporary, never pushed)
         run: docker build -t "scan:${{ inputs.service-name }}" "${{ inputs.service-path }}"
 

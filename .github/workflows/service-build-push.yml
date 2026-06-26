@@ -84,6 +84,10 @@ jobs:
       - name: Push
         run: docker push "$IMAGE:${{ steps.meta.outputs.tag }}"
 
+  gitops:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
       # ---- GitOps write-back: bump values-dev.yaml in lablumen-k8s (rebase-retry for race safety) ----
       - name: Checkout ${{ inputs.k8s-repo }}
         uses: actions/checkout@v4
@@ -95,7 +99,7 @@ jobs:
       - name: Bump dev image tag
         working-directory: k8s
         env:
-          TAG: ${{ steps.meta.outputs.tag }}
+          TAG: ${{ needs.build.outputs.tag }}
           SVC: ${{ inputs.service-name }}
         run: |
           git config user.name  "github-actions[bot]"
