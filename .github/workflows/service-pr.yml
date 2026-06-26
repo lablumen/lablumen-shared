@@ -107,7 +107,7 @@ jobs:
             -Dsonar.qualitygate.wait=true
 
   sca:
-    needs: lint-and-test
+    needs: sast
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -151,7 +151,7 @@ jobs:
           snyk test --severity-threshold=high
 
   container-scan:
-    needs: lint-and-test
+    needs: sca
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
